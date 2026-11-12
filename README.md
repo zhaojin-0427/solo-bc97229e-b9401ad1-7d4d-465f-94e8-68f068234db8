@@ -1,10 +1,38 @@
 # SQL 字段溯源 · 敏感列影响分析（Flask + Docker Compose）
 
 面向「客户分群视图交付广告代理商前，评估手机号等敏感字段影响」的静态血缘工具。
-粘贴**源表有序字段及敏感标记**和**单条 SQLite SELECT**，逐列展示每个输出列
-源自哪些源字段、经由哪些 CTE 列传播，并高亮敏感来源。
+粘贴**源表有序字段及敏感标记**和**单条 SQLite SELECT**，先给出每个输出列的
+源字段摘要（值来源 / 条件来源 / 敏感分类），再按需**逐层展开**血缘图，
+任一分支都能追到源字段。
 
 **只做静态语法分析与字段级溯源，不连接数据库、不执行 SQL，也不判断表达式能否脱敏。**
+
+---
+
+## 0. 路径膨胀修复（本版重点）
+
+分群视图常见写法：每层 CTE 用 `UNION ALL` 把上一层引用两次：
+
+```sql
+WITH c0 AS (SELECT mobile AS x FROM customer WHERE city = 'BJ'),
+     c1 AS (SELECT x FROM c0 UNION ALL SELECT x FROM c0),
+     ...
+     c25 AS (SELECT x FROM c24 UNION ALL SELECT x FROM c24)
+SELECT x FROM c25
+```
+
+完整路径数为 `2^层数`：旧实现为每个输出列物化全部「源字段 → 输出」完整路径，
+11 层即产生约 9.8 MB 结果，25 层无法完成。
+
+本版改为**共享血缘图（DAG）**：
+
+- 每个列节点只记录「直接上游 + 一跳元数据」的边，图规模与 SQL 线性相关
+  （25 层示例：79 节点 / 204 边，分析耗时毫秒级，响应约 7 KB）；
+- `UNION ALL` 的每个分支保留独立边（即使指向同一上游列，也按 branch 编号分开），
+  **不截断路径、不丢弃来源、不合并值/条件依赖类别**；
+- 计算、API 响应与页面初始渲染都**不枚举完整路径**：先返回源字段摘要，
+  用户点击「展开值/条件依赖」后由 `/api/expand` 逐层返回直接上游，
+  每个分支都可继续展开直到源字段。
 
 ---
 
@@ -23,7 +51,8 @@ INNER/LEFT JOIN、CASE、WHERE、UNION ALL、敏感字段），打开即自动�
 docker compose down
 ```
 
-容器内使用 gunicorn 启动 `server:app`，健康检查访问 `/`。
+容器内使用 gunicorn 启动 `server:app`（1 worker × 8 线程；分析会话保存在
+进程内存中，故固定单 worker），健康检查访问 `/`。
 
 ## 2. 本地直接运行（可选，需自行准备 Python 3.11 与 Flask）
 
@@ -37,6 +66,8 @@ python app/server.py        # 监听 8000
 ```bash
 python -m unittest discover -s tests -v
 ```
+
+（`tests/test_server.py` 的 HTTP 接口用例需要 Flask，未安装时自动跳过。）
 
 ---
 
@@ -109,27 +140,67 @@ orders(order_id, cust_id, amount, status)
 ├── app
 │   ├── Dockerfile              # python:3.11-slim + gunicorn
 │   ├── requirements.txt
-│   ├── server.py               # Flask 路由：/ 与 POST /api/analyze
+│   ├── server.py               # Flask 路由：/、POST /api/analyze、POST /api/expand
 │   ├── lineage
 │   │   ├── tokenizer.py        # 词法分析
 │   │   ├── ast_nodes.py        # AST 定义
 │   │   ├── parser.py           # 递归下降解析（白名单语法）
 │   │   ├── schema.py           # 源表结构与敏感标记解析
-│   │   ├── analyzer.py         # 值/条件双轨依赖传播引擎
+│   │   ├── analyzer.py         # 共享血缘图：值/条件双轨依赖 + 逐层展开
 │   │   ├── demo_data.py        # 内置示例
 │   │   └── errors.py           # 带行列号的错误类型
 │   ├── templates/index.html    # 单页界面
 │   └── static/{style.css,app.js}
-└── tests/test_lineage.py       # 62 个标准库 unittest 用例
+└── tests/                      # 标准库 unittest（引擎 70 例 + HTTP 接口 4 例）
 ```
 
 ## 7. HTTP 接口
 
-`POST /api/analyze`，请求体：
+### `POST /api/analyze`
+
+请求体：
 
 ```json
 { "schema": "customer(cust_id, mobile*)", "sql": "SELECT cust_id FROM customer" }
 ```
 
-成功 `200`：`{"ok": true, "result": { "outputs": [...], "ctes": [...], "base_tables": [...] }}`；
+成功 `200`：
+
+```json
+{
+  "ok": true,
+  "result": {
+    "analysis_id": "…",
+    "outputs": [
+      {
+        "node_id": "n8", "position": 1, "name": "cust_id",
+        "sensitive": false, "sensitive_kind": [],
+        "value_sources": [{"table": "customer", "column": "cust_id", "sensitive": false, "base_id": "n1"}],
+        "condition_sources": [],
+        "value_source_count": 1, "condition_source_count": 0
+      }
+    ],
+    "ctes": [],
+    "base_tables": [],
+    "graph_stats": {"nodes": 2, "edges": 1}
+  }
+}
+```
+
+响应只含**源字段摘要**与图统计，不含任何完整路径枚举。
 语法/溯源错误 `400`：`{"ok": false, "error": "第 x 行第 y 列：..."}`。
+
+### `POST /api/expand`
+
+按用户点击逐层展开某节点的**直接上游**（一跳）：
+
+```json
+{ "analysis_id": "…", "node_id": "n8", "mode": "value" }
+```
+
+- `mode`：`value`（值依赖）、`condition`（条件依赖）；返回的每条边带
+  `next_mode`，继续展开时原样回传即可（`condition-all` / `condition-value`
+  用于条件链路内部，对应「WHERE/ON 直接引用的来源列，其值路径也按条件传播」）。
+- 每条边含 `hop`（块名、列名、kind、UNION 分支号、WHERE/ON 子句等）与
+  `target` 节点摘要；`target.is_base=true` 即到达源字段。
+- 会话不存在 `404`；节点/模式非法 `400`。

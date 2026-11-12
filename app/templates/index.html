@@ -11,7 +11,8 @@
   <h1>SQL 字段溯源 · 敏感列影响分析</h1>
   <p class="subtitle">
     粘贴源表有序字段（字段名后加 <code>*</code> 标记敏感）与单条 SQLite SELECT，
-    逐列展示源字段及经由的 CTE 列路径。只做静态溯源，不执行 SQL。
+    先展示每个输出列的源字段摘要，再按需逐层展开血缘图直到源字段。
+    只做静态溯源，不执行 SQL；深层 UNION ALL 链也不会枚举完整路径。
   </p>
 </header>
 
@@ -28,6 +29,7 @@
     <div class="actions">
       <button id="run" type="button">开始溯源</button>
       <button id="reset" type="button" class="secondary">恢复示例</button>
+      <button id="deep-demo" type="button" class="secondary">载入 25 层 UNION ALL 示例</button>
       <span id="status" class="status"></span>
     </div>
     <div id="error" class="error-box" hidden></div>
@@ -35,7 +37,7 @@
       <span class="tag tag-value">值依赖敏感</span>
       <span class="tag tag-cond">条件依赖敏感</span>
       <span class="tag tag-both">两类兼有</span>
-      <span class="hint">值依赖 = 输出表达式引用（含 CASE 条件）；条件依赖 = 沿途 WHERE / JOIN ON 引用，作用于该查询块全部输出。</span>
+      <span class="hint">值依赖 = 输出表达式引用（含 CASE 条件）；条件依赖 = 沿途 WHERE / JOIN ON 引用，作用于该查询块全部输出。结果先给源字段摘要，点击“展开值/条件依赖”逐层查看，任一分支均可追到源字段。</span>
     </div>
   </section>
 

@@ -1,4 +1,4 @@
-"""溯源分析引擎。
+"""溯源分析引擎（共享血缘图版）。
 
 对已解析的 AST 做字段级血缘分析，严格区分两类依赖：
 - 值依赖（value）：输出表达式实际引用到的列，沿表达式（含 CASE 的条件分支）
@@ -8,6 +8,29 @@
 
 一个源字段可同时属于两类。任何未知/歧义字段均直接报错；引擎不执行 SQL，
 也不判断某个表达式是否可以脱敏。
+
+实现要点（路径膨胀修复）
+------------------------
+旧实现为每个输出列保存“从源字段到该列的全部完整路径”（list of list of hop）。
+当每层 UNION ALL 都把上一层引用两次时，路径数逐层翻倍（2^n），
+11 层即约 9.8MB，25 层无法完成。
+
+本实现改为保存**共享的有向无环血缘图**：
+
+- 每个列节点（源表列 / CTE 列 / UNION 合并列 / 最终输出列）只记录
+  “直接上游节点 + 一跳元数据”的边，边的数量与 SQL 规模线性相关；
+- UNION ALL 的每个分支分别创建节点并保留独立边（即使两个分支最终指向
+  同一条上游列，也会保留两条带 branch 编号的边），因此不会丢失任何分支关系；
+- 每个节点的值/条件源字段集合通过图上的可达性归纳计算（按节点缓存），
+  不枚举完整路径；
+- 对外视图只返回源字段摘要 + 节点 id；具体某一层的直接上游由 /api/expand
+  按用户点击逐层获取，响应大小同样与 SQL 规模线性相关。
+
+条件依赖在图上的归纳：
+- 值遍历只走 value 边；
+- 条件遍历只走 condition 边。直接来自 WHERE/ON 的条件边带 recolor=True，
+  表示该来源列自身的 value 路径也应以“条件传播”语义继续向下追溯
+  （对应旧实现 _recolor_paths）；其余继承/CTE/UNION 条件边只继续走条件边。
 """
 
 from . import ast_nodes as ast
@@ -22,18 +45,33 @@ _VALUE_NODES = (
 # 允许出现在 WHERE / ON 谓词中的节点类型（在值节点之外增加比较与逻辑运算）
 _PREDICATE_EXTRA_NODES = (ast.InList, ast.LikeExpr, ast.IsNull)
 
+_CMP_SET = {"=", "==", "<>", "!=", "<", ">", "<=", ">="}
+
+EXPAND_MODES = ("value", "condition", "condition-all", "condition-value")
+
 
 # ---------- 内部数据结构 ----------
 
+class Edge:
+    """血缘图中的一条有向边：下游列 -> 直接上游列，附带一跳元数据。"""
+
+    __slots__ = ("id", "target_id", "hop", "recolor")
+
+    def __init__(self, edge_id, target_id, hop, recolor=False):
+        self.id = edge_id
+        self.target_id = target_id
+        self.hop = hop
+        # True：该条件边来自 WHERE/ON 的直接引用，来源列自身的 value 路径
+        # 也要作为条件链路继续追溯（旧实现的 _recolor_paths 语义）。
+        self.recolor = recolor
+
+
 class ColumnNode:
-    """血缘图中的一列（源表列、CTE 输出列或最终输出列）。"""
+    """血缘图中的一列（源表列、CTE 输出列、UNION 列或最终输出列）。"""
 
-    _seq = 0
-
-    def __init__(self, node_type, name, table=None, block_label="",
+    def __init__(self, node_id, node_type, name, table=None, block_label="",
                  expr_text=None, from_star=False, position=None):
-        ColumnNode._seq += 1
-        self.id = f"{node_type}-{ColumnNode._seq}"
+        self.id = node_id
         self.node_type = node_type        # 'base' | 'cte' | 'output' | 'union'
         self.name = name
         self.table = table                # 源表名（base 节点）
@@ -41,10 +79,16 @@ class ColumnNode:
         self.expr_text = expr_text
         self.from_star = from_star
         self.position = position          # 在所属查询块中的列序号
-        self.value_deps = {}              # base_id -> [path, ...]
-        self.condition_deps = {}          # base_id -> [path, ...]
+        self.value_edges = []             # [Edge]，直接值上游
+        self.condition_edges = []         # [Edge]，直接条件上游
+        self.value_base_ids = frozenset()     # 可达源字段 id（值语义）
+        self.condition_base_ids = frozenset() # 可达源字段 id（条件语义）
         self.sensitive = False
         self.sensitive_kind = set()       # 'value' | 'condition'
+
+    @property
+    def is_base(self):
+        return self.node_type == "base"
 
 
 class Source:
@@ -123,14 +167,10 @@ def check_value_expr(expr, context, err_tok=None):
         check_value_expr(expr.operand, context)
     elif isinstance(expr, ast.CaseExpr):
         # CASE 内部允许比较/逻辑/IN/LIKE/IS
-        sub = collect_refs(expr)  # 先做可达性检查由解析阶段保证
         for sub_expr in _case_sub_expressions(expr):
             check_predicate_or_value(sub_expr)
     elif isinstance(expr, ast.ColumnRef) or isinstance(expr, ast.Literal):
         pass
-
-
-_CMP_SET = {"=", "==", "<>", "!=", "<", ">", "<=", ">="}
 
 
 def _case_sub_expressions(case):
@@ -225,68 +265,83 @@ def canonical_expr(expr):
     raise LineageError("内部错误：无法生成表达式文本")  # pragma: no cover
 
 
-# ---------- 依赖合并工具 ----------
-
-def _merge_deps(target, source_deps, extra_hop=None):
-    """把 source_deps（base_id -> paths）并入 target；可选地给每条路径追加一跳。"""
-    def _same_path(a, b):
-        if len(a) != len(b):
-            return False
-        return all(x == y for x, y in zip(a, b))
-
-    for base_id, paths in source_deps.items():
-        bucket = target.setdefault(base_id, [])
-        for path in paths:
-            new_path = list(path)
-            if extra_hop is not None:
-                new_path = new_path + [extra_hop]
-            if not any(_same_path(existing, new_path) for existing in bucket):
-                bucket.append(new_path)
-
-
-def _extend_paths(paths, hop):
-    return [list(p) + [hop] for p in paths]
-
-
-def _recolor_paths(deps, new_kind, clause=None, ref=None):
-    """把一组依赖路径上所有 hop 的 kind 改写（深拷贝，避免污染原值依赖）。
-
-    用于条件依赖：来源列沿值路径传播而来，但在 WHERE/ON 语境下应展示为条件链路。
-    """
-    out = {}
-    for base_id, paths in deps.items():
-        new_paths = []
-        for path in paths:
-            new_path = []
-            for hop in path:
-                h = dict(hop)
-                h["kind"] = new_kind
-                if clause is not None:
-                    h["clause"] = clause
-                if ref is not None:
-                    h["ref"] = ref
-                new_path.append(h)
-            new_paths.append(new_path)
-        out[base_id] = new_paths
-    return out
-
-
 # ---------- 分析器主体 ----------
 
 class Analyzer:
     def __init__(self, tables):
         self.tables = tables                       # schema 解析结果
-        self.base_nodes = {}                      # (table_lower, col_lower) -> ColumnNode
-        self.cte_records = []                     # 视图模型用 CTE 信息
+        self.base_nodes = {}                       # (table_lower, col_lower) -> ColumnNode
+        self.nodes = {}                            # node_id -> ColumnNode
+        self.cte_records = []                      # 视图模型用 CTE 信息
+        self._node_seq = 0
+        self._edge_seq = 0
         self._init_base_nodes()
+
+    # ---- 节点/边构造 ----
+
+    def _new_node(self, node_type, name, **kwargs):
+        self._node_seq += 1
+        node = ColumnNode(f"n{self._node_seq}", node_type, name, **kwargs)
+        self.nodes[node.id] = node
+        return node
+
+    def _add_edge(self, bucket, target_id, hop, recolor=False):
+        """向 bucket 追加一条边；完全相同的边（同一上游 + 同一跳元数据）去重。
+
+        注意：UNION 分支的 branch 编号在 hop 中，因此即使多个分支指向同一条
+        上游列，也会保留为多条独立边，分支关系不会被合并。
+        """
+        target = self.nodes.get(target_id)
+        if target is None:  # pragma: no cover - 内部一致性
+            raise LineageError(f"内部错误：边指向不存在的节点 {target_id}")
+        hop_key = tuple(sorted(hop.items()))
+        for existing in bucket:
+            if (existing.target_id == target_id
+                    and existing.recolor == recolor
+                    and tuple(sorted(existing.hop.items())) == hop_key):
+                return existing
+        self._edge_seq += 1
+        edge = Edge(f"e{self._edge_seq}", target_id, dict(hop), recolor)
+        bucket.append(edge)
+        return edge
+
+    def _refresh_node(self, node):
+        """按直接上游节点的缓存集合归纳本节点的源字段集合（不枚举完整路径）。"""
+        value_ids = set()
+        for edge in node.value_edges:
+            target = self.nodes[edge.target_id]
+            if target.is_base:
+                value_ids.add(target.id)
+            else:
+                value_ids.update(target.value_base_ids)
+
+        condition_ids = set()
+        for edge in node.condition_edges:
+            target = self.nodes[edge.target_id]
+            if target.is_base:
+                # 直接出现在 WHERE/ON 中的源字段（recolor=True）；继承型条件边
+                # 指向基础列时，其自身没有条件依赖，不应贡献任何来源。
+                if edge.recolor:
+                    condition_ids.add(target.id)
+            elif edge.recolor:
+                # 旧 _recolor_paths：该来源列的值路径 + 其既有条件路径都算条件。
+                condition_ids.update(target.value_base_ids)
+                condition_ids.update(target.condition_base_ids)
+            else:
+                # 继承/CTE/UNION 条件：只继续传播已有的条件依赖。
+                condition_ids.update(target.condition_base_ids)
+
+        node.value_base_ids = frozenset(value_ids)
+        node.condition_base_ids = frozenset(condition_ids)
+        self._refresh_sensitivity(node)
 
     def _init_base_nodes(self):
         for tkey, spec in self.tables.items():
             for col in spec.columns:
-                node = ColumnNode("base", col.name, table=spec.name,
-                                  block_label=f"源表 {spec.name}",
-                                  position=col.position)
-                node.value_deps[node.id] = [[]]
+                node = self._new_node(
+                    "base", col.name, table=spec.name,
+                    block_label=f"源表 {spec.name}", position=col.position)
+                node.value_base_ids = frozenset([node.id])
                 if col.sensitive:
                     node.sensitive = True
                     node.sensitive_kind.add("value")
@@ -306,7 +361,7 @@ class Analyzer:
             visible_ctes = {}
         # 本层 CTE 映射：内层可引用外层，但同名时内层遮蔽外层
         cte_map = dict(visible_ctes)
-        for idx, cte in enumerate(query.ctes, start=1):
+        for cte in query.ctes:
             label = f"CTE {cte.name}"
             inner_nodes = self._analyze_query(
                 cte.query, block_prefix=f"CTE {cte.name}", depth=depth + 1,
@@ -348,16 +403,15 @@ class Analyzer:
         for pos in range(width):
             peers = [branch[pos] for branch in branch_outputs]
             name = peers[0].name
-            node = ColumnNode("union", name, block_label=block_prefix,
-                              position=pos + 1)
+            node = self._new_node("union", name, block_label=block_prefix,
+                                  position=pos + 1)
             for bi, peer in enumerate(peers, start=1):
                 hop = {"block": peer.block_label, "name": peer.name,
                        "kind": "union-branch", "branch": bi}
-                _merge_deps(node.value_deps, peer.value_deps, hop)
-                cond_hop = {"block": peer.block_label, "name": peer.name,
-                            "kind": "union-branch", "branch": bi}
-                _merge_deps(node.condition_deps, peer.condition_deps, cond_hop)
-            self._refresh_sensitivity(node)
+                # 每个分支都保留一条独立边（哪怕最终指向同一上游）。
+                self._add_edge(node.value_edges, peer.id, hop)
+                self._add_edge(node.condition_edges, peer.id, hop, recolor=False)
+            self._refresh_node(node)
             merged.append(node)
         return merged
 
@@ -374,11 +428,11 @@ class Analyzer:
         out = []
         for alias, old in zip(aliases, nodes):
             hop = {"block": label, "name": alias, "kind": "cte-output"}
-            node = ColumnNode("cte", alias, block_label=label,
-                              expr_text=old.expr_text, position=old.position)
-            _merge_deps(node.value_deps, old.value_deps, hop)
-            _merge_deps(node.condition_deps, old.condition_deps, hop)
-            self._refresh_sensitivity(node)
+            node = self._new_node("cte", alias, block_label=label,
+                                  expr_text=old.expr_text, position=old.position)
+            self._add_edge(node.value_edges, old.id, hop)
+            self._add_edge(node.condition_edges, old.id, hop, recolor=False)
+            self._refresh_node(node)
             out.append(node)
         return out
 
@@ -502,16 +556,16 @@ class Analyzer:
 
     def _make_passthrough_node(self, src_node, label, position, star,
                                condition_entries, is_cte):
-        node = ColumnNode("cte" if is_cte else "output",
-                          src_node.name, block_label=label,
-                          expr_text=src_node.name, from_star=star,
-                          position=position)
+        node = self._new_node("cte" if is_cte else "output",
+                              src_node.name, block_label=label,
+                              expr_text=src_node.name, from_star=star,
+                              position=position)
         hop = {"block": label, "name": src_node.name,
                "kind": "star" if star else "ref"}
-        _merge_deps(node.value_deps, src_node.value_deps, hop)
+        self._add_edge(node.value_edges, src_node.id, hop)
         self._inherit_upstream_conditions(node, [src_node], label)
         self._apply_conditions(node, condition_entries, label)
-        self._refresh_sensitivity(node)
+        self._refresh_node(node)
         return node
 
     def _make_expr_node(self, rc, sources, label, position,
@@ -527,41 +581,39 @@ class Analyzer:
         else:
             name = canonical_expr(rc.expr)
 
-        node = ColumnNode("cte" if is_cte else "output",
-                          name, block_label=label,
-                          expr_text=canonical_expr(rc.expr),
-                          position=position)
+        node = self._new_node("cte" if is_cte else "output",
+                              name, block_label=label,
+                              expr_text=canonical_expr(rc.expr),
+                              position=position)
         for src_node in resolved:
             hop = {"block": label, "name": name, "kind": "value",
                    "expr": canonical_expr(rc.expr)}
-            _merge_deps(node.value_deps, src_node.value_deps, hop)
+            self._add_edge(node.value_edges, src_node.id, hop)
         self._inherit_upstream_conditions(node, resolved, label)
         self._apply_conditions(node, condition_entries, label)
-        self._refresh_sensitivity(node)
+        self._refresh_node(node)
         return node
 
     def _inherit_upstream_conditions(self, node, src_nodes, label):
         """来源列在其上游查询块中累积的条件依赖，沿值引用继续向下游传递。"""
         for src_node in src_nodes:
+            if src_node.is_base:
+                # 基础列自身没有任何条件依赖，继承边不会产生来源，直接跳过，
+                # 避免在血缘图中留下指向源字段的空条件边。
+                continue
             hop = {"block": label, "name": node.name, "kind": "condition",
                    "clause": "INHERITED", "ref": src_node.name}
-            _merge_deps(node.condition_deps, src_node.condition_deps, hop)
+            self._add_edge(node.condition_edges, src_node.id, hop, recolor=False)
 
     def _apply_conditions(self, node, condition_entries, label):
         # 条件依赖作用于“所在查询块全部输出”：本块 WHERE/ON 引用到的源字段，
         # 无论输出表达式是否引用，都计入每个输出列的条件依赖。
         for clause, ref, src_node in condition_entries:
             ref_text = f"{ref.table}.{ref.name}" if ref.table else ref.name
-            out_hop = {"block": label, "name": node.name, "kind": "condition",
-                       "clause": clause, "ref": ref_text}
-            # 来源列的值路径在条件语境下重标为 condition，避免前端误显示为值传递
-            value_deps = _recolor_paths(src_node.value_deps, "condition",
-                                        clause=clause, ref=ref_text)
-            _merge_deps(node.condition_deps, value_deps, out_hop)
-            # 来源列自身携带的上游条件依赖继续向下游传播
-            up_hop = {"block": label, "name": node.name, "kind": "condition",
-                      "clause": clause, "ref": ref_text}
-            _merge_deps(node.condition_deps, src_node.condition_deps, up_hop)
+            hop = {"block": label, "name": node.name, "kind": "condition",
+                   "clause": clause, "ref": ref_text}
+            # recolor=True：来源列自身的 value 路径也作为条件链路继续追溯。
+            self._add_edge(node.condition_edges, src_node.id, hop, recolor=True)
 
     def _find_source(self, table_name, sources, star_node):
         key = table_name.lower()
@@ -575,13 +627,13 @@ class Analyzer:
     # ---- 敏感标记 ----
 
     def _refresh_sensitivity(self, node):
-        """节点依赖装配完成后立即重算敏感性（值/条件分别判定，可兼有）。"""
-        for base_id in node.value_deps:
+        """节点源字段集合装配完成后立即重算敏感性（值/条件分别判定，可兼有）。"""
+        for base_id in node.value_base_ids:
             base = self._base_by_id.get(base_id)
             if base is not None and base.sensitive:
                 node.sensitive = True
                 node.sensitive_kind.add("value")
-        for base_id in node.condition_deps:
+        for base_id in node.condition_base_ids:
             base = self._base_by_id.get(base_id)
             if base is not None and base.sensitive:
                 node.sensitive = True
@@ -591,27 +643,48 @@ class Analyzer:
 
     def _node_brief(self, node):
         return {
+            "node_id": node.id,
             "name": node.name,
             "sensitive": node.sensitive,
             "sensitive_kind": sorted(node.sensitive_kind),
             "expr_text": node.expr_text,
+            "value_source_count": len(node.value_base_ids),
+            "condition_source_count": len(node.condition_base_ids),
+        }
+
+    def _node_detail(self, node):
+        return {
+            "node_id": node.id,
+            "name": node.name,
+            "block": node.block_label,
+            "node_type": node.node_type,
+            "is_base": node.is_base,
+            "table": node.table,
+            "column": node.name if node.is_base else None,
+            "expr_text": node.expr_text,
+            "from_star": node.from_star,
+            "position": node.position,
+            "sensitive": node.sensitive,
+            "sensitive_kind": sorted(node.sensitive_kind),
+            "value_source_count": len(node.value_base_ids),
+            "condition_source_count": len(node.condition_base_ids),
         }
 
     def _build_view(self, query, final_nodes):
-        base_lookup = {node.id: node for node in self.base_nodes.values()}
         outputs = []
         for node in final_nodes:
-            value_paths = self._format_deps(node.value_deps, base_lookup)
-            condition_paths = self._format_deps(node.condition_deps, base_lookup)
             outputs.append({
+                "node_id": node.id,
                 "position": node.position,
                 "name": node.name,
                 "expr_text": node.expr_text,
                 "from_star": node.from_star,
                 "sensitive": node.sensitive,
                 "sensitive_kind": sorted(node.sensitive_kind),
-                "value_sources": value_paths,
-                "condition_sources": condition_paths,
+                "value_sources": self._format_bases(node.value_base_ids),
+                "condition_sources": self._format_bases(node.condition_base_ids),
+                "value_source_count": len(node.value_base_ids),
+                "condition_source_count": len(node.condition_base_ids),
             })
 
         base_tables = []
@@ -625,30 +698,100 @@ class Analyzer:
                 ],
             })
 
+        edge_count = sum(len(n.value_edges) + len(n.condition_edges)
+                         for n in self.nodes.values())
         return {
             "outputs": outputs,
             "ctes": self.cte_records,
             "base_tables": base_tables,
+            "graph_stats": {"nodes": len(self.nodes), "edges": edge_count},
         }
 
-    def _format_deps(self, deps, base_lookup):
+    def _format_bases(self, base_ids):
         result = []
-        for base_id, paths in deps.items():
-            base = base_lookup[base_id]
+        for base_id in base_ids:
+            base = self._base_by_id.get(base_id)
+            if base is None:  # pragma: no cover - 内部一致性
+                continue
             result.append({
-                "base_id": base_id,
+                "base_id": base.id,
                 "table": base.table,
                 "column": base.name,
                 "sensitive": base.sensitive,
-                "paths": paths,
             })
         result.sort(key=lambda d: (d["table"], d["column"]))
         return result
 
+    # ---- 按需逐层展开 ----
 
-def analyze(schema_text, sql_text):
-    """对外主入口：源表结构文本 + 单条 SELECT 文本 -> 溯源视图模型。"""
+    def expand(self, node_id, mode):
+        """返回某节点的**直接上游**一跳（不递归、不枚举完整路径）。
+
+        mode:
+        - value            值依赖：只沿 value 边
+        - condition        条件依赖：只沿 condition 边
+        - condition-all    条件上下文中的“全量”节点（直接 WHERE/ON 引用的来源列）：
+                           同时展示其 value 边（标记 as_condition）与 condition 边
+        - condition-value  条件上下文中的 value 边（旧 _recolor_paths 语义）
+        """
+        node = self.nodes.get(node_id)
+        if node is None:
+            raise LineageError(f"节点 {node_id} 不存在或已过期，请重新分析")
+        if mode not in EXPAND_MODES:
+            raise LineageError(
+                f"未知的展开模式 {mode!r}，可选值：{', '.join(EXPAND_MODES)}")
+
+        edges = []
+
+        def push(edge, kind, as_condition, next_mode):
+            edges.append({
+                "edge_id": edge.id,
+                "kind": kind,
+                "as_condition": as_condition,
+                "recolor": edge.recolor,
+                "next_mode": next_mode,
+                "hop": dict(edge.hop),
+                "target": self._node_detail(self.nodes[edge.target_id]),
+            })
+
+        if mode == "value":
+            for edge in node.value_edges:
+                push(edge, "value", False, "value")
+
+        elif mode == "condition":
+            for edge in node.condition_edges:
+                push(edge, "condition", False,
+                     "condition-all" if edge.recolor else "condition")
+
+        elif mode == "condition-all":
+            for edge in node.value_edges:
+                push(edge, "value", True, "condition-value")
+            for edge in node.condition_edges:
+                push(edge, "condition", False,
+                     "condition-all" if edge.recolor else "condition")
+
+        elif mode == "condition-value":
+            for edge in node.value_edges:
+                push(edge, "value", True, "condition-value")
+
+        return {
+            "node": self._node_detail(node),
+            "mode": mode,
+            "edges": edges,
+            "edge_count": len(edges),
+        }
+
+
+def analyze_with_analyzer(schema_text, sql_text):
+    """返回 (视图模型, Analyzer)。Analyzer 持有共享血缘图，供展开接口使用。"""
     tables = parse_schemas(schema_text)
     query = parse_sql(sql_text)
     analyzer = Analyzer(tables)
-    return analyzer.analyze(query)
+    result = analyzer.analyze(query)
+    return result, analyzer
+
+
+def analyze(schema_text, sql_text):
+    """对外主入口：源表结构文本 + 单条 SELECT 文本 -> 溯源摘要视图模型。"""
+    result, _analyzer = analyze_with_analyzer(schema_text, sql_text)
+    return result

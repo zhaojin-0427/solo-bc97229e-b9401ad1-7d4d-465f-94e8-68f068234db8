@@ -3,13 +3,15 @@
 运行：python -m unittest discover -s tests -v
 """
 
+import json
 import os
 import sys
+import time
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "app"))
 
-from lineage import analyze  # noqa: E402
+from lineage import analyze, analyze_with_analyzer  # noqa: E402
 from lineage.errors import LineageError  # noqa: E402
 
 SCHEMA = """
@@ -34,6 +36,16 @@ def dep_tables(sources):
     return {(d["table"], d["column"]) for d in sources}
 
 
+def deep_chain_sql(layers):
+    """c0 = SELECT mobile AS x FROM customer WHERE city='BJ'；
+    之后每层 UNION ALL 两次引用上一层；最终 SELECT x。"""
+    parts = ["c0 AS (SELECT mobile AS x FROM customer WHERE city = 'BJ')"]
+    for i in range(1, layers + 1):
+        parts.append(
+            f"c{i} AS (SELECT x FROM c{i - 1} UNION ALL SELECT x FROM c{i - 1})")
+    return "WITH " + ",\n".join(parts) + f"\nSELECT x FROM c{layers}"
+
+
 class BasicLineageTests(unittest.TestCase):
 
     def test_simple_select_qualified_and_alias(self):
@@ -43,7 +55,18 @@ class BasicLineageTests(unittest.TestCase):
         self.assertEqual(dep_tables(col["value_sources"]),
                          {("customer", "cust_id")})
         self.assertFalse(col["sensitive"])
-        self.assertEqual(col["value_sources"][0]["paths"][0][0]["kind"], "value")
+
+    def test_value_edge_kind_via_expand(self):
+        result, analyzer = analyze_with_analyzer(
+            SCHEMA, "SELECT c.cust_id AS id FROM customer AS c")
+        col = result["outputs"][0]
+        exp = analyzer.expand(col["node_id"], "value")
+        self.assertEqual(len(exp["edges"]), 1)
+        edge = exp["edges"][0]
+        self.assertEqual(edge["hop"]["kind"], "value")
+        self.assertEqual(edge["target"]["node_type"], "base")
+        self.assertEqual((edge["target"]["table"], edge["target"]["column"]),
+                         ("customer", "cust_id"))
 
     def test_constant_column_has_no_value_dependency(self):
         r = analyze(SCHEMA, "SELECT cust_id, 'VIP' AS tag, 100 AS n FROM customer")
@@ -117,6 +140,9 @@ class BasicLineageTests(unittest.TestCase):
         name_col = out_by_name(r, "name")
         self.assertNotIn(("customer", "mobile"),
                          dep_tables(name_col["value_sources"]))
+        # 未被 WHERE 引用的列不应出现在条件来源中
+        self.assertNotIn(("customer", "cust_id"),
+                         dep_tables(name_col["condition_sources"]))
 
     def test_inner_join_on_condition_propagation(self):
         sql = """
@@ -140,20 +166,36 @@ class BasicLineageTests(unittest.TestCase):
         r = analyze(SCHEMA, sql)
         self.assertEqual(names(r), ["cust_id", "order_id"])
 
-    def test_cte_chain_path_hops(self):
+    def test_cte_chain_expands_through_cte_blocks(self):
         sql = """
         WITH c1 AS (SELECT cust_id, mobile FROM customer WHERE city = 'BJ'),
              c2 AS (SELECT cust_id, mobile FROM c1)
         SELECT cust_id, mobile FROM c2
         """
-        r = analyze(SCHEMA, sql)
-        mobile = out_by_name(r, "mobile")
+        result, analyzer = analyze_with_analyzer(SCHEMA, sql)
+        mobile = out_by_name(result, "mobile")
         self.assertIn("value", mobile["sensitive_kind"])
-        # 路径至少经过 c1、c2 两个 CTE 块
-        path = mobile["value_sources"][0]["paths"][0]
-        blocks = [hop["block"] for hop in path]
-        self.assertTrue(any("CTE c1" in b for b in blocks))
-        self.assertTrue(any("CTE c2" in b for b in blocks))
+        # 沿 value 边逐层展开，应依次经过 CTE c2、CTE c1，最终到源字段
+        seen_blocks = set()
+        frontier = [(mobile["node_id"], "value")]
+        leaves = set()
+        visited = set()
+        while frontier:
+            node_id, mode = frontier.pop()
+            if (node_id, mode) in visited:
+                continue
+            visited.add((node_id, mode))
+            exp = analyzer.expand(node_id, mode)
+            seen_blocks.add(exp["node"]["block"])
+            for edge in exp["edges"]:
+                tgt = edge["target"]
+                if tgt["is_base"]:
+                    leaves.add((tgt["table"], tgt["column"]))
+                else:
+                    frontier.append((tgt["node_id"], edge["next_mode"]))
+        self.assertTrue(any("CTE c1" in b for b in seen_blocks))
+        self.assertTrue(any("CTE c2" in b for b in seen_blocks))
+        self.assertIn(("customer", "mobile"), leaves)
         # WHERE 中的 city 作为条件依赖贯穿到最终输出
         self.assertIn(("customer", "city"),
                       dep_tables(mobile["condition_sources"]))
@@ -172,15 +214,17 @@ class BasicLineageTests(unittest.TestCase):
         UNION ALL
         SELECT cust_id, mobile FROM log
         """
-        r = analyze(SCHEMA, sql)
-        self.assertEqual(names(r), ["cust_id", "mobile"])
-        mobile = out_by_name(r, "mobile")
+        result, analyzer = analyze_with_analyzer(SCHEMA, sql)
+        self.assertEqual(names(result), ["cust_id", "mobile"])
+        mobile = out_by_name(result, "mobile")
         self.assertEqual(dep_tables(mobile["value_sources"]),
                          {("customer", "mobile"), ("log", "mobile")})
-        # 每个来源路径上都有 union-branch 跳
-        for dep in mobile["value_sources"]:
-            for path in dep["paths"]:
-                self.assertTrue(any(h["kind"] == "union-branch" for h in path))
+        # 最终查询本身就是 UNION：输出节点即 union 节点，两个分支各一条边
+        exp = analyzer.expand(mobile["node_id"], "value")
+        branches = sorted(e["hop"].get("branch") for e in exp["edges"])
+        self.assertEqual(branches, [1, 2])
+        self.assertTrue(all(e["hop"]["kind"] == "union-branch"
+                            for e in exp["edges"]))
 
     def test_nested_cte_can_reference_outer(self):
         sql = """
@@ -439,6 +483,140 @@ class ConditionPropagationTests(unittest.TestCase):
         col = out_by_name(ok, "cust_id")
         self.assertIn(("customer", "city"),
                       dep_tables(col["condition_sources"]))
+
+    def test_condition_expansion_reaches_condition_source(self):
+        sql = ("WITH c AS (SELECT cust_id, name FROM customer "
+               "WHERE mobile IS NOT NULL) "
+               "SELECT name FROM c")
+        result, analyzer = analyze_with_analyzer(SCHEMA, sql)
+        out = result["outputs"][0]
+        # 条件展开应能追到 customer.mobile
+        frontier = [(out["node_id"], "condition")]
+        visited = set()
+        leaves = set()
+        while frontier:
+            node_id, mode = frontier.pop()
+            if (node_id, mode) in visited:
+                continue
+            visited.add((node_id, mode))
+            exp = analyzer.expand(node_id, mode)
+            for edge in exp["edges"]:
+                tgt = edge["target"]
+                if tgt["is_base"]:
+                    leaves.add((tgt["table"], tgt["column"]))
+                else:
+                    frontier.append((tgt["node_id"], edge["next_mode"]))
+        self.assertIn(("customer", "mobile"), leaves)
+
+
+class DeepChainTests(unittest.TestCase):
+    """路径膨胀修复：每层 UNION ALL 两次引用上一层，完整路径数为 2^n。"""
+
+    def test_25_layers_completes_quickly(self):
+        sql = deep_chain_sql(25)
+        start = time.time()
+        result, analyzer = analyze_with_analyzer(SCHEMA, sql)
+        elapsed = time.time() - start
+        self.assertLess(elapsed, 5.0)
+        out = result["outputs"][0]
+        self.assertEqual(out["name"], "x")
+        self.assertEqual(dep_tables(out["value_sources"]),
+                         {("customer", "mobile")})
+        self.assertEqual(dep_tables(out["condition_sources"]),
+                         {("customer", "city")})
+        self.assertEqual(out["sensitive_kind"], ["value"])
+        # 血缘图规模与 SQL 线性相关，而非 2^25
+        stats = result["graph_stats"]
+        self.assertLess(stats["nodes"], 500)
+        self.assertLess(stats["edges"], 1000)
+
+    def test_response_does_not_enumerate_full_paths(self):
+        for layers in (11, 25):
+            result = analyze(SCHEMA, deep_chain_sql(layers))
+            for out in result["outputs"]:
+                self.assertNotIn("paths", out)
+                for key in ("value_sources", "condition_sources"):
+                    for dep in out[key]:
+                        self.assertNotIn("paths", dep)
+            payload = json.dumps(result, ensure_ascii=False).encode("utf-8")
+            # 11 层旧实现约 9.8MB；新实现必须保持极小且与层数近似线性
+            self.assertLess(len(payload), 200 * 1024)
+
+    def test_every_union_branch_preserved_and_traceable(self):
+        layers = 25
+        result, analyzer = analyze_with_analyzer(SCHEMA, deep_chain_sql(layers))
+        out = result["outputs"][0]
+        frontier = [(out["node_id"], "value")]
+        visited = set()
+        leaves = set()
+        union_branch_edges = 0
+        while frontier:
+            node_id, mode = frontier.pop()
+            if (node_id, mode) in visited:
+                continue
+            visited.add((node_id, mode))
+            exp = analyzer.expand(node_id, mode)
+            for edge in exp["edges"]:
+                if edge["hop"].get("kind") == "union-branch":
+                    union_branch_edges += 1
+                tgt = edge["target"]
+                if tgt["is_base"]:
+                    leaves.add((tgt["table"], tgt["column"]))
+                else:
+                    frontier.append((tgt["node_id"], edge["next_mode"]))
+        # 每个 UNION 层保留 2 条分支边（c1..c25）
+        self.assertEqual(union_branch_edges, layers * 2)
+        self.assertEqual(leaves, {("customer", "mobile")})
+
+    def test_duplicate_branches_to_same_upstream_kept_separate(self):
+        sql = """
+        WITH a AS (SELECT mobile AS x FROM customer),
+             u AS (SELECT x FROM a UNION ALL SELECT x FROM a)
+        SELECT x FROM u
+        """
+        result, analyzer = analyze_with_analyzer(SCHEMA, sql)
+        out = result["outputs"][0]
+        exp = analyzer.expand(out["node_id"], "value")
+        union_id = exp["edges"][0]["target"]["node_id"]
+        uexp = analyzer.expand(union_id, "value")
+        self.assertEqual(len(uexp["edges"]), 2)
+        branches = sorted(e["hop"]["branch"] for e in uexp["edges"])
+        self.assertEqual(branches, [1, 2])
+        # 两个分支节点各自独立，且都能继续追到同一 CTE 列
+        branch_ids = {e["target"]["node_id"] for e in uexp["edges"]}
+        self.assertEqual(len(branch_ids), 2)
+        for e in uexp["edges"]:
+            bexp = analyzer.expand(e["target"]["node_id"], "value")
+            self.assertEqual(len(bexp["edges"]), 1)
+            self.assertEqual(bexp["edges"][0]["target"]["node_type"], "cte")
+
+    def test_condition_chain_through_25_layers(self):
+        result, analyzer = analyze_with_analyzer(SCHEMA, deep_chain_sql(25))
+        out = result["outputs"][0]
+        frontier = [(out["node_id"], "condition")]
+        visited = set()
+        leaves = set()
+        while frontier:
+            node_id, mode = frontier.pop()
+            if (node_id, mode) in visited:
+                continue
+            visited.add((node_id, mode))
+            exp = analyzer.expand(node_id, mode)
+            for edge in exp["edges"]:
+                tgt = edge["target"]
+                if tgt["is_base"]:
+                    leaves.add((tgt["table"], tgt["column"]))
+                else:
+                    frontier.append((tgt["node_id"], edge["next_mode"]))
+        self.assertEqual(leaves, {("customer", "city")})
+
+    def test_expand_rejects_unknown_node_and_mode(self):
+        _result, analyzer = analyze_with_analyzer(
+            SCHEMA, "SELECT cust_id FROM customer")
+        with self.assertRaises(LineageError):
+            analyzer.expand("nope", "value")
+        with self.assertRaises(LineageError):
+            analyzer.expand("n1", "bogus")
 
 
 if __name__ == "__main__":
